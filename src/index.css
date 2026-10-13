@@ -1,0 +1,69 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --pri: #00d4ff;
+    --pri-dim: #007a99;
+    --pri-gho: #001f2e;
+    --border: #0d3347;
+    --border-b: #1a5c7a;
+    --panel: #010d14;
+    --panel-2: #010f18;
+    --text: #8ffcff;
+    --text-dim: #3a8a9a;
+    --text-med: #5ab8cc;
+  }
+
+  body {
+    background-color: #00060a;
+    font-family: 'Share Tech Mono', monospace, -apple-system, sans-serif;
+  }
+}
+
+/* Custom HUD scrollbars */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(1, 13, 20, 0.7);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-b);
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--pri);
+}
+
+/* Subtle Sci-Fi CRT scanline and vignette overlay */
+.hud-scanline {
+  background: linear-gradient(
+    rgba(18, 16, 16, 0) 50%, 
+    rgba(0, 0, 0, 0.25) 50%
+  ), linear-gradient(
+    90deg,
+    rgba(255, 0, 0, 0.03),
+    rgba(0, 255, 0, 0.01),
+    rgba(0, 0, 255, 0.03)
+  );
+  background-size: 100% 3px, 6px 100%;
+  pointer-events: none;
+}
+
+.hud-grid-bg {
+  background-image: radial-gradient(rgba(0, 212, 255, 0.12) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+@keyframes pulse-glow {
+  0%, 100% { opacity: 0.8; filter: drop-shadow(0 0 8px var(--pri)); }
+  50% { opacity: 1; filter: drop-shadow(0 0 16px var(--pri)); }
+}
+
+.glow-hud {
+  animation: pulse-glow 3s ease-in-out infinite;
+}

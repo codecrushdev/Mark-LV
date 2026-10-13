@@ -1,0 +1,8 @@
+{
+  "name": "MARK LV - Personal AI Assistant HUD",
+  "description": "Cross-platform personal AI assistant HUD with holographic avatar, real-time voice lip-sync, Gemini model ladder, system telemetry, video display, memory graph, and remote dashboard.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
