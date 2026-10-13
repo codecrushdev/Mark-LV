@@ -179,10 +179,38 @@ def _smart_type(text: str, clear_first: bool = True) -> str:
 
 
 def _click(x=None, y=None, button: str = "left", clicks: int = 1) -> str:
+    """Click at (x, y). Coordinates are accepted in ANY of three spaces and
+    normalised to real screen pixels before the click — this is what fixes
+    clicks landing above/below the target:
+
+      • absolute screen pixels          → clamped only
+      • normalised 0-1000 (vision-model space, both axes ≤ 1000) → scaled by
+        the *captured pixel* size, not pyautogui.size() (HiDPI mismatch)
+      • fractional 0..1                → scaled by captured pixel size
+    """
     _require_pyautogui()
     if x is not None and y is not None:
-        pyautogui.click(x, y, button=button, clicks=clicks)
-        return f"{'Double-c' if clicks == 2 else 'C'}licked ({x}, {y}) [{button}]"
+        try:
+            fx, fy = float(x), float(y)
+        except (TypeError, ValueError):
+            return f"Invalid click coordinates: ({x}, {y})"
+        scr_w, scr_h = _grab_size()
+
+        if 0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0 and (fx < 1.0 or fy < 1.0):
+            px, py = fx * scr_w, fy * scr_h                          # fractional
+        elif fx <= 1000 and fy <= 1000 and max(scr_w, scr_h) > 1000:
+            px, py = fx / 1000.0 * scr_w, fy / 1000.0 * scr_h        # norm 0-1000
+        else:
+            px, py = fx, fy                                          # absolute px
+
+        ix, iy = _clamp_px(px, py, scr_w, scr_h)
+        # move first, then click at the settled position: eliminates drift
+        # when a duration-based moveTo was used previously
+        pyautogui.moveTo(ix, iy, duration=0)
+        cx, cy = pyautogui.position()
+        pyautogui.click(cx, cy, button=button, clicks=clicks)
+        return (f"{'Double-c' if clicks == 2 else 'C'}licked ({cx}, {cy}) "
+                f"[{button}] on {scr_w}×{scr_h} screen")
     pyautogui.click(button=button, clicks=clicks)
     return f"Clicked at current position [{button}]"
 
@@ -310,50 +338,221 @@ def _focus_window(title: str) -> str:
 
     return f"focus_window: unknown OS '{os_name}'"
 
-def _screen_find(description: str) -> tuple[int, int] | None:
-    api_key = _get_api_key()
-    if not api_key:
-        print("[ComputerControl] ⚠️ No API key for screen_find")
+def _screen_grab():
+    """Full-resolution screen capture. Returns a PIL image, or None."""
+    try:
+        from PIL import ImageGrab
+        img = ImageGrab.grab(all_screens=True)
+        if img is not None:
+            return img.convert("RGB")
+    except Exception:
+        pass
+    try:
+        _require_pyautogui()
+        return pyautogui.screenshot()
+    except Exception:
         return None
 
+
+def _grab_size() -> tuple[int, int]:
+    """Pixel size of the actual capture — this is what the model sees and what
+    coordinates must be mapped back to. On HiDPI / Retina displays
+    pyautogui.size() (logical points) differs from the captured pixel size;
+    using it for scaling was the source of clicks landing above/below target."""
     try:
-        from google import genai
+        img = _screen_grab()
+        if img is not None:
+            return img.size          # (w, h) in real pixels
+    except Exception:
+        pass
+    _require_pyautogui()
+    return pyautogui.size()
+
+
+def _clamp_px(px: float, py: float, scr_w: int, scr_h: int) -> tuple[int, int]:
+    return (int(round(min(max(px, 0), scr_w - 1))),
+            int(round(min(max(py, 0), scr_h - 1))))
+
+
+def _to_pixels(x, y) -> tuple[int, int]:
+    """Normalise a caller-supplied point (fractional 0..1, normalised 0-1000,
+    or absolute pixels) into clamped absolute screen pixels. Denominators are
+    the full capture width/height — subtracting 1 would bias every click by up
+    to a pixel toward the top-left."""
+    try:
+        fx, fy = float(x), float(y)
+    except (TypeError, ValueError):
+        return (0, 0)
+    scr_w, scr_h = _grab_size()
+    if 0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0 and (fx < 1.0 or fy < 1.0):
+        fx, fy = fx * scr_w, fy * scr_h                      # fractional
+    elif fx <= 1000 and fy <= 1000 and max(scr_w, scr_h) > 1000:
+        fx, fy = fx / 1000.0 * scr_w, fy / 1000.0 * scr_h    # norm 0-1000
+    return _clamp_px(fx, fy, scr_w, scr_h)
+
+
+def _map_point(px: float, py: float, img_w: int, img_h: int,
+               scr_w: int, scr_h: int) -> tuple[int, int]:
+    """Map a point given in *image* space to *screen* space. If the vision
+    model was fed the full-resolution screenshot (img == screen size) this is
+    a plain clamp; if it saw a resized copy the point is scaled back exactly."""
+    sx = px * scr_w / float(img_w or scr_w or 1)
+    sy = py * scr_h / float(img_h or scr_h or 1)
+    return (int(round(min(max(sx, 0), max(scr_w - 1, 0)))),
+            int(round(min(max(sy, 0), max(scr_h - 1, 0)))))
+
+
+def _norm_box_to_screen(box: list, scr_w: int, scr_h: int) -> tuple[int, int]:
+    """Convert a normalised [0-1000] box [x1,y1,x2,y2] (Gemini convention) to
+    the centre point in absolute screen pixels. Uses the full width/height as
+    denominator — subtracting 1 here shifts every click slightly up-left."""
+    x1, y1, x2, y2 = box
+    cx = (min(x1, x2) + max(x1, x2)) / 2.0
+    cy = (min(y1, y2) + max(y1, y2)) / 2.0
+    px = cx / 1000.0 * scr_w
+    py = cy / 1000.0 * scr_h
+    return (int(round(min(max(px, 0), scr_w - 1))),
+            int(round(min(max(py, 0), scr_h - 1))))
+
+
+def _abs_box_to_screen(box: list, img_w: int, img_h: int,
+                       scr_w: int, scr_h: int) -> tuple[int, int]:
+    """Convert an absolute-pixel box [x1,y1,x2,y2] measured on a screenshot of
+    size (img_w,img_h) to the centre point on a screen of size (scr_w,scr_h)."""
+    x1, y1, x2, y2 = box
+    cx = (min(x1, x2) + max(x1, x2)) / 2.0
+    cy = (min(y1, y2) + max(y1, y2)) / 2.0
+    return _map_point(cx, cy, img_w, img_h, scr_w, scr_h)
+
+
+def _parse_box(text: str):
+    """Return ([x1,y1,x2,y2], coord_space) where coord_space is 'norm' (0-1000)
+    or 'abs' (pixels). Accepts Gemini's box output formats and plain x,y.
+
+    Disambiguation rule: a 4-tuple whose max value is <= 1000 is treated as
+    normalised ONLY when the screen is wider/taller than 1000 px (otherwise an
+    absolute pixel box on a small screen could be mistaken for norm coords).
+    A bare x,y point is interpreted in image-pixel space by the caller, which
+    knows the exact size of the image that was sent to the model."""
+    t = text or ""
+    m = re.search(r"\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]", t)
+    if m:
+        box = [int(m.group(i)) for i in range(1, 5)]
+        space = "norm" if max(box) <= 1000 else "abs"
+        return box, space
+    m = re.search(r"\bcoordinates?\b[^0-9]*?(\d+)\s*[,x]\s*(\d+)", t, re.I)
+    if not m:
+        m = re.search(r"^\s*(\d+)\s*,\s*(\d+)\s*$", t.strip())
+    if m:
+        x, y = int(m.group(1)), int(m.group(2))
+        return [x, y, x, y], "abs"     # caller maps against sent-image size
+    return None, ""
+
+
+def _vision_find(prompt_fn, description: str):
+    """Shared vision-element finder. The screenshot is sent at FULL native
+    resolution and the model is asked for a normalised 0-1000 bounding box of
+    the clickable element; the box centre is then mapped to absolute screen
+    pixels with exact scale factors (never against pyautogui.size(), which on
+    HiDPI displays differs from the captured pixel grid).
+    Returns (x, y) in absolute screen pixels, or None."""
+    grab = _screen_grab()
+    if grab is None:
+        return None
+    scr_w, scr_h = grab.size                    # real pixel geometry
+
+    def _to_screen(raw: str):
+        box, space = _parse_box(raw)
+        if box is None:
+            return None
+        if space == "norm":
+            return _norm_box_to_screen(box, scr_w, scr_h)
+        # absolute pixels — image we sent was full-res, so map 1:1 w/ clamp
+        return _abs_box_to_screen(box, scr_w, scr_h, scr_w, scr_h)
+
+    prompt = prompt_fn()
+
+    # ── preferred path: unified router (honours user's custom API config) ───
+    try:
+        sys.path.insert(0, str(_BASE))
+        from core import api_router
+        prov = api_router.active_provider()
+    except Exception:
+        prov = None
+    if prov is not None and prov.get("kind") != "ollama":
+        try:
+            buf = io.BytesIO()
+            grab.save(buf, format="JPEG", quality=92)
+            import base64 as _b64
+            b64 = _b64.b64encode(buf.getvalue()).decode()
+            messages = [{
+                "role": "user",
+                "content": [
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                    {"type": "text", "text": prompt},
+                ],
+            }]
+            headers = {"Content-Type": "application/json"}
+            if prov.get("api_key"):
+                headers["Authorization"] = f"Bearer {prov['api_key']}"
+            r = requests.post(f"{prov['base_url']}/v1/chat/completions",
+                              json={"model": prov["selected_model"],
+                                    "messages": messages, "stream": False,
+                                    "temperature": 0.0, "max_tokens": 300},
+                              headers=headers, timeout=45)
+            r.raise_for_status()
+            content = ((r.json().get("choices") or [{}])[0]
+                       .get("message") or {}).get("content") or ""
+            if "NOT_FOUND" not in content.upper():
+                pt = _to_screen(content)
+                if pt:
+                    return pt
+        except Exception as e:
+            print(f"[ComputerControl] ⚠️ vision via custom provider failed: {e}")
+
+    # ── fallback: Gemini ladder ──────────────────────────────────────────────
+    try:
         from google.genai import types as gtypes
-
-        _require_pyautogui()
-        w, h  = pyautogui.size()
-        img   = pyautogui.screenshot()
-        buf   = io.BytesIO()
-        img.save(buf, format="PNG")
-        image_bytes = buf.getvalue()
-
-        prompt = (
-            f"This is a screenshot of a {w}×{h} pixel screen. "
-            f"Locate the UI element described as: '{description}'. "
-            f"Reply with ONLY the center coordinates as: x,y "
-            f"If the element is not visible, reply: NOT_FOUND"
-        )
-
         from core import gemini
+        buf = io.BytesIO()
+        grab.save(buf, format="PNG")
         response = gemini.call(
-            [gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png"), prompt],
+            [gtypes.Part.from_bytes(data=buf.getvalue(), mime_type="image/png"),
+             prompt],
             tier=gemini.FAST, timeout_ms=20_000,
         )
-        if response is None:
-            return None
-
-        text = (response.text or "").strip()
-        if "NOT_FOUND" in text.upper():
-            return None
-
-        match = re.search(r"(\d+)\s*,\s*(\d+)", text)
-        if match:
-            return int(match.group(1)), int(match.group(2))
-
+        if response is not None:
+            text = (response.text or "").strip()
+            if "NOT_FOUND" not in text.upper():
+                return _to_screen(text)
     except Exception as e:
         print(f"[ComputerControl] ⚠️ screen_find failed: {e}")
 
     return None
+
+
+_FIND_PROMPT_TMPL = (
+    "You are a precise UI element locator. The attached image is a full computer "
+    "screenshot of size {w}×{h} pixels. Find the UI element described below and "
+    "report its EXACT clickable bounding box.\n"
+    "Element: '{desc}'\n"
+    "Rules:\n"
+    "- Report the tightest box that fully contains the clickable element "
+    "(including its label/padding), NOT just the text glyphs.\n"
+    "- Coordinates MUST be normalised to a 0-1000 scale relative to the image: "
+    "x_norm = round(x_pixel / {w} * 1000), y_norm = round(y_pixel / {h} * 1000).\n"
+    "- Reply with ONLY this format: [x1,y1,x2,y2]\n"
+    "- If several candidates match, pick the most prominent/clickable one.\n"
+    "- If the element is not visible, reply: NOT_FOUND"
+)
+
+
+def _screen_find(description: str) -> tuple[int, int] | None:
+    def prompt_for():
+        w, h = _grab_size()
+        return _FIND_PROMPT_TMPL.format(w=w, h=h, desc=description)
+    return _vision_find(prompt_for, description)
 
 def computer_control(
     parameters: dict,
@@ -400,6 +599,15 @@ def computer_control(
       focus_window  — bring window to foreground
       screen_find   — AI element finder (returns x,y)
       screen_click  — AI element finder + click
+
+    Coordinate contract for click/double_click/right_click/move/drag:
+      The vision layer reports positions as a normalised 0-1000 bounding box;
+      _screen_find already converts that to exact absolute pixels. When the
+      model passes x/y directly, any of these spaces is accepted and mapped
+      onto the *captured* pixel grid (HiDPI-safe): absolute pixels, or
+      normalised 0-1000 values when both axes are ≤ 1000 on screens larger
+      than 1000 px. Prefer screen_click with a description over raw
+      coordinates whenever possible — it is far more accurate.
       random_data   — generate fake form data
       user_data     — pull real data from memory
     """
@@ -435,13 +643,12 @@ def computer_control(
             return _click(params.get("x"), params.get("y"), "right", 1)
 
         if action == "move":
-            return _move(int(params.get("x", 0)), int(params.get("y", 0)))
+            return _move(*_to_pixels(params.get("x", 0), params.get("y", 0)))
 
         if action == "drag":
-            return _drag(
-                int(params.get("x1", 0)), int(params.get("y1", 0)),
-                int(params.get("x2", 0)), int(params.get("y2", 0)),
-            )
+            x1, y1 = _to_pixels(params.get("x1", 0), params.get("y1", 0))
+            x2, y2 = _to_pixels(params.get("x2", 0), params.get("y2", 0))
+            return _drag(x1, y1, x2, y2)
 
         if action == "hotkey":
             raw  = params.get("keys", "")

@@ -1,7 +1,7 @@
 import json
 import re
 from datetime import datetime
-from threading import Lock
+from threading import RLock
 from pathlib import Path
 import sys
 
@@ -14,7 +14,7 @@ def get_base_dir() -> Path:
 
 BASE_DIR         = get_base_dir()
 MEMORY_PATH      = BASE_DIR / "memory" / "long_term.json"
-_lock            = Lock()
+_lock            = RLock()
 MAX_VALUE_LENGTH = 380
 
 # ── Why there are two very different numbers here ────────────────────────────
@@ -125,6 +125,14 @@ def save_memory(memory: dict) -> None:
             json.dumps(memory, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+    # Mirror every saved fact into the single project database (memory/jarvis.db)
+    # and feed new knowledge into the graph automatically. Never let a graph
+    # hiccup break memory writes.
+    try:
+        from memory import knowledge_graph as _kg
+        _kg.sync_memory_facts(memory)
+    except Exception as e:
+        print(f"[Memory] ⚠️ graph sync failed: {e}")
 
 
 def _truncate_value(val: str) -> str:
